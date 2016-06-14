@@ -1,0 +1,9 @@
+[Socket]
+#ListenStream=@qbic-ldap-pwresetd
+ListenStream=/run/pwreset/pwresetd.sock
+Backlog=1
+SocketUser=pwadmin
+SocketGroup=pwadmin
+
+[Install]
+WantedBy=sockets.target 

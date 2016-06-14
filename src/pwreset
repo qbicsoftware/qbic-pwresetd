@@ -1,0 +1,429 @@
+#!/usr/bin/env python
+
+# qbic-pwresetd a password reset daemon for the QBiC services
+# Copyright (C) 2016  Sven Nahnsen <sven.nahnsen@uni-tuebingen.de>
+
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+
+# --------------------------------------------------------------------------
+# $Author: Enrico Tagliavini <enrico.tagliavini@uni-tuebingen.de> $
+# --------------------------------------------------------------------------
+
+__author__ = 'Enrico Tagliavini <enrico.tagliavini@uni-tuebingen.de>'
+
+import argparse
+import atexit
+import os.path
+import signal
+import socket
+import sys
+
+from traceback import format_exc, print_exc
+
+from qbic_pwresetd.clientprotocol import send_request, get_answer
+from qbic_pwresetd import BadAnswer, ProtocolError, a_ack, a_nak, a_badrequest, a_error, answer_list
+
+
+progname = os.path.basename(sys.argv[0])
+
+(QUIET, ERROR, WARNING, INFO, DEBUG) = range(0, 5)
+# This is the default verbosity level
+#vlevel = INFO
+vlevel = DEBUG
+testonly = False
+
+sock = None
+
+yn_choice = (['n', 'N', False], ['y', 'Y', True])
+
+class store_sendmail(argparse.Action):
+	def __call__(self, parser, args_ns, value, option_string = None):
+		setattr(args_ns, self.dest, value)
+		setattr(args_ns, 'enabled', value)
+		return
+
+class store_enabled(argparse.Action):
+	def __call__(self, parser, args_ns, value, option_string = None):
+		if not value and getattr(args_ns, 'enabled', False):
+			raise argparse.ArgumentError(self, 'conflicting options: \'--sendmail y\' and \'--enabled n\'')
+		setattr(args_ns, self.dest, value)
+		return
+
+def vprint(message, fd=sys.stdout, verbosity=INFO):
+	if verbosity >= DEBUG:
+		s = inspect.stack()[1:3]
+		if s[0][3] in ['printout', 'printerr']:
+			message = s[1][3] + ': ' + message
+		else:
+			message = s[0][3] + ': ' + message
+	if testonly:
+		message = '[TEST] ' + message
+	if verbosity <= vlevel:
+		fd.write(message + '\n')
+	return
+
+def printout(message, verbosity=INFO):
+	vprint(message, sys.stdout, verbosity)
+	return
+
+def printerr(message, verbosity=INFO):
+	vprint(message, sys.stderr, verbosity)
+	return
+
+def atexit_handler():
+	sock.shutdown(socket.SHUT_RDWR)
+	sock.close()
+	sock = None
+	return
+
+signnum2name = dict((getattr(signal, n), n) for n in dir(signal) if n.startswith('SIG') and '_' not in n )
+def sigterm_handler(signum, frame):
+	try:
+		signame = signnum2name[signum]
+	except KeyError:
+		signame = str(signum)
+	printerr('Received signal %s' % signame)
+	# the atexit_handler will be called with this
+	sys.exit(1)
+
+def my_bool(string):
+	if string in yn_choice[1]:
+		value = True
+	elif string in yn_choice[0]:
+		value = False
+	else:
+		msg = "%r is not a boolean" % string
+		raise argparse.ArgumentTypeError(msg)
+	return value
+
+def parse_create_request(args):
+	return [
+		'%s=%s' % (args.identify_by, args.username),
+		args.secret,
+		args.duration,
+		args.enabled
+	]
+
+def parse_list_requests(args):
+	return [args.limit]
+
+#def parse_reset_password(args):
+
+def parse_enable_request(args):
+	return [args.secret]
+
+def parse_send_email(args):
+	return [args.msg_type, args.secret]
+#	return [(x, msg_type) for x in args.secret]
+
+_cmd2parse_funct = {
+	'CREATEREQUEST': parse_create_request,
+#	'GETREQUEST': parse_get_request,  # Not implemented yet
+	'LISTREQUESTS': parse_list_requests,
+#	'RESETPW': parse_reset_password,
+	'ENABLEREQUEST': parse_enable_request,
+	'DISABLEREQUEST': parse_enable_request,
+	'SENDEMAIL': parse_send_email,
+}
+def request(sock, cmd, args):
+	send_request(sock, cmd, _cmd2parse_funct[cmd](args))
+	return get_answer(sock, cmd)
+
+def parse_simple_answer(answer):
+	return answer 
+
+def parse_answer_list_requests(answer):
+	return '\n' + '\n'.join([str(x) for x in answer])
+
+def parse_answer_enable_requests(answer):
+	(sec, status) = answer
+	return '%s %s' % (sec, 'enabled' if status else 'disabled')
+
+def parse_answer_send_email(answer):
+	(ok, notok) = answer
+	return 'SENT (%d): %s, NOT SENT(%d): %s' % (len(ok), ' '.join(ok), len(notok), ' '.join(notok))
+
+_cmd2parse_answer = {
+	'CREATEREQUEST': (parse_simple_answer, []),
+#	'GETREQUEST': (parse_answer_get_request, []),  # Not implemented yet
+	'LISTREQUESTS': (parse_answer_list_requests, [a_ack]),
+#	'RESETPW': (parse_simple_answer, []),
+	'ENABLEREQUEST': (parse_simple_answer, []),
+	'DISABLEREQUEST': (parse_simple_answer, []),
+	'SENDEMAIL': (parse_answer_send_email, [a_ack, a_nak]),
+#	'TESTPROTOCOL': (parse_simple_answer, []),
+}
+
+cmd_map = {
+	'createrequest':	'CREATEREQUEST',
+#	'':			'GETREQUEST',
+	'listrequests':		'LISTREQUESTS',
+#	'':			'RESETPW',
+	'enablerequest':	'ENABLEREQUEST',
+	'disablerequest':	'DISABLEREQUEST',
+	'sendemail':		'SENDEMAIL',
+#	'':			'TESTPROTOCOL',
+}
+def run_command(count, cmd, cmd_args):
+	try:
+		return request(sock, cmd, cmd_args)
+	except ProtocolError as e:
+		printerr('%d %s: protocol error: %s' % (count, cmd, str(e)))
+		sys.exit(1)
+	except BadAnswer as e:
+		printerr('%d %s: bad answer: %s' % (count, cmd, str(e)))
+		sys.exit(1)
+	except socket.error as e:
+		printerr('%d %s: socket error: %s' % (count, cmd, str(e)))
+		sys.exit(1)
+	return (None, None)
+
+def print_answer(count, cmd, status, answer):
+	if status in _cmd2parse_answer[cmd][1]:
+		p_fnct = _cmd2parse_answer[cmd][0]
+	else:
+		p_fnct = parse_simple_answer
+	if status in [a_ack, a_nak]:
+		printfnct = printout
+	else:
+		printfnct = printerr
+	printfnct('%d %s: %s' % (count, cmd, p_fnct(answer)))
+
+def pwreset_main(args, subargs):
+	global sock
+	
+	if sys.version_info > '2':
+		# python3
+		address = args.socket.decode('unicode_escape')
+	else:
+		# python2
+		address = args.socket.decode('string_escape')
+
+	signal.signal(signal.SIGTERM, sigterm_handler)
+	signal.signal(signal.SIGINT, sigterm_handler)
+	try:
+		op = 'creating the socket object'
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		op = 'connecting to socket `%s\'' % args.socket
+		sock.connect(address)
+	except (OSError, IOError) as e:
+		printerr('Error while %s: %s' % (op, str(e)))
+		sys.exit(1)
+	except socket.error as e:
+		printerr('Socket error while %s: %s' % (op, str(e)))
+		sys.exit(1)
+
+	count = 1
+	for (cmd, cmd_args) in subargs:
+		cmd = cmd_map[cmd]
+		(status, answer) = run_command(count, cmd, cmd_args)
+		print_answer(count, cmd, status, answer)
+		# check the chain, only one implemented atm
+		if cmd == 'CREATEREQUEST' and cmd_args.sendemail:
+			cmd = 'SENDEMAIL'
+			args = argparse.Namespace()
+			setattr(args, 'msg_type', cmd_args.msg_type)
+			setattr(args, 'secret', [answer])
+			(status, answer) = run_command(count, cmd, args)
+			print_answer(count, cmd, status, answer)
+		count += 1
+
+	#test_protocol_client(s)
+	return
+
+def split_argv(commands, argv):
+	ret = []
+	prev = 0
+	for i in xrange(1, len(argv)):
+		if argv[i] in commands:
+			ret.append(argv[prev:i])
+			prev = i
+	ret.append(argv[prev:])
+	return ret
+
+def main():
+	parser = argparse.ArgumentParser(
+			prog = progname,
+			description = 'QBiC password reset service provider client',
+			#usage = '%(prog)s [options] command [command options] [command ...]',
+			epilog = 'use `%s command --help\' to get help about a specific command' % progname,
+	)
+	parser.add_argument(
+		'-s', '--socket', '--address',
+		action = 'store',
+		required = False,
+		default = '/var/run/pwreset/pwresetd.sock',
+		help = 'specify the socket address (abstract socket) or path where to connect to'
+	)
+
+	subcommands = {}
+	sc = 'createrequest'
+	subcommands[sc] = argparse.ArgumentParser(
+			prog = '%s %s' % (progname, sc),
+			description = 'Add a new request to the DB'
+	)
+	subcommands[sc].add_argument(
+			'--identify-by',
+			choices = ['username', 'email'],
+			required = False,
+			default = 'username',
+			help = 'identify the user by username or email address (via --username argument). ' + \
+				'By default the --username argument will be used as the user username'
+	)
+	subcommands[sc].add_argument(
+			'-u', '--username',
+			required = True,
+			action = 'store',
+			help = 'username of the user or email address (username lookup will be attempted) if --identify-by email is given'
+	)
+	subcommands[sc].add_argument(
+			'-s', '--secret',
+			required = False,
+			action = 'store',
+			dest = 'secret',
+			default = 'autogenerate',
+			help = 'create the new request with the given secret. If not given one will be automatically generated'
+	)
+	subcommands[sc].add_argument(
+			'-d', '--duration',
+			required = True,
+			action = 'store',
+			type = int,
+			help = 'how many hours the request should be valid for since the creation'
+	)
+	subcommands[sc].add_argument(
+			'-e', '--enabled',
+			choices = yn_choice[0] + yn_choice[1],
+			action = store_enabled,
+			type = my_bool,
+			required = False,
+			default = 'n',
+			help = 'choose if the request should be enabled or not just after the creation. Default is n'
+	)
+	subcommands[sc].add_argument(
+			'--sendemail',
+			choices = yn_choice[0] + yn_choice[1],
+			action = store_sendmail,
+			type = my_bool,
+			required = False,
+			default = 'n',
+			help = 'optionally send the email right after the request is create. Implies --enabled=y. Default is n'
+	)
+	subcommands[sc].add_argument(
+		'-t', '--msg-type',
+		action = 'store',
+		required = False,
+		default = 'default_reset',
+		help = 'the type of message that should be sent to the users if --sendemail=y is specified. ' + \
+			'By default `default_reset\' message type will be used.'
+	)
+
+	sc = 'listrequests'
+	subcommands[sc] = argparse.ArgumentParser(
+			prog = '%s %s' % (progname, sc),
+			description = 'List requests already in the DB'
+	)
+	subcommands[sc].add_argument(
+			'-l', '--limit',
+			action = 'store',
+			default = 30,
+			type = int,
+			help = 'maximum number of requests to be shown'
+	)
+
+	sc = 'enablerequest'
+	subcommands[sc] = argparse.ArgumentParser(
+			prog = '%s %s' % (progname, sc),
+			description = 'enable the request identified by SECRET'
+	)
+	subcommands[sc].add_argument(
+		'-s', '--secret',
+		action = 'store',
+		required = True,
+		help = 'secret identifying the request to enable'
+	)
+
+	sc = 'disablerequest'
+	subcommands[sc] = argparse.ArgumentParser(
+			prog = '%s %s' % (progname, sc),
+			description = 'disable the request identified by SECRET'
+	)
+	subcommands[sc].add_argument(
+		'-s', '--secret',
+		action = 'store',
+		required = True,
+		help = 'secret identifying the request to disable'
+	)
+
+	sc = 'sendemail'
+	subcommands[sc] = argparse.ArgumentParser(
+			prog = '%s %s' % (progname, sc),
+			description = 'send a notification email for the specified request (secret)'
+	)
+	subcommands[sc].add_argument(
+		'-t', '--msg-type',
+		action = 'store',
+		required = False,
+		default = 'default_reset',
+		help = 'the type of message that should be sent to the users associated with the given secret. ' + \
+			'If not specified the default_reset message will be used. Multiple --msg_type can be specified ' + \
+			'by calling the command multiple times as `sendemail -t type1 secrets... sendmail -t type2 secrets\'' + \
+			'only one message type per call is allowed'
+	)
+	subcommands[sc].add_argument(
+			'secret',
+			nargs = '+',
+			metavar = 'secret',
+			help = 'secret for which the email should be sent'
+	)
+
+	# just a fake for the sake of the help text
+	parser.add_argument(
+			'command',
+			nargs = '*',
+			help = 'action(s) to perform. Available commands are: ' + ', '.join(subcommands.keys())
+	)
+	argv = [progname] + sys.argv[1:]
+	argvs = split_argv([progname] + subcommands.keys(), argv)
+
+	args = parser.parse_args(argvs[0][1:])
+	if args.command and len(args.command) > 0:
+		printerr('Unknown command%s: %s' % ('s' if len(args.command) > 1 else '', ', '.join(args.command)))
+		sys.exit(1)
+
+	# if there is a --help somewhere, just display it and quit
+	for v in argvs[1:]:
+		if '-h' in v or '--help' in v:
+			subcommands[v[0]].parse_args(v[1:])
+			sys.exit(0)
+
+	subargs = []
+	for v in argvs[1:]:
+		subargs.append((v[0], subcommands[v[0]].parse_args(v[1:])))
+
+	pwreset_main(args, subargs)
+	return
+
+if __name__ == '__main__':
+	try:
+		main()
+	except KeyboardInterrupt:
+		ret = 1
+		print('')
+	except Exception as e:
+		ret = 1
+		print(''.join(format_exc(1).split('\n')[1:3]))
+		print_exc()
+

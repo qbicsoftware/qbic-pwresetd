@@ -1,0 +1,8 @@
+include src/qbicpwresetd.py
+include qbic-pwresetd.socket
+include qbic-pwresetd.service
+include sql/*.sql
+include sql/*.sh
+include cfg/qbic-ldap-pwd-resetd.ini
+include qbic-pwresetd.spec
+include tests/*

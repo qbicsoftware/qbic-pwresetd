@@ -1,0 +1,819 @@
+#!/usr/bin/env python
+
+# qbic-pwresetd a password reset daemon for the QBiC services
+# Copyright (C) 2016  Sven Nahnsen <sven.nahnsen@uni-tuebingen.de>
+
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+
+# --------------------------------------------------------------------------
+# $Author: Enrico Tagliavini <enrico.tagliavini@uni-tuebingen.de> $
+# --------------------------------------------------------------------------
+
+__author__ = 'Enrico Tagliavini <enrico.tagliavini@uni-tuebingen.de>'
+
+import argparse
+import atexit
+import errno
+import ldap
+import logging
+import logging.handlers
+import MySQLdb
+import os.path
+import re
+import smtplib
+import signal
+import socket
+import sqlite3
+import struct
+import sys
+
+# be python3 ready
+try:
+	# python 2.3 - 2.7
+	from ConfigParser import RawConfigParser, NoOptionError, Error as ConfigError
+except ImportError:
+	# python 3
+	from configparser import RawConfigParser, NoOptionError, Error as ConfigError
+from email.mime.text import MIMEText
+from errno import EAGAIN, EWOULDBLOCK
+from hashlib import sha256
+from logging import CRITICAL, ERROR, WARNING, INFO, DEBUG
+from pytz import timezone
+from pwd import getpwnam
+from qbic_pwresetd.pw_check import pwd_score
+from qbic_pwresetd.qbicldap import init_ldap, disconnect_ldap, get_attrs_from_uid, get_email_from_uid, get_uid_from_email, change_ldap_password
+from qbic_pwresetd.resetrequest import DBManager, ResetRequest
+from qbic_pwresetd.serverprotocol import get_command, send_answer
+from qbic_pwresetd import config, ArgumentError, BadRequest, ProtocolError, a_badrequest, a_ack, a_error, a_nak
+from stat import S_ISSOCK
+from string import Template
+from systemd.daemon import listen_fds, is_socket_unix
+from time import sleep
+from traceback import format_exc, print_exc
+
+# from systemd src/basic/exit-status.h
+# https://cgit.freedesktop.org/systemd/systemd/tree/src/basic/exit-status.h
+EXIT_FAILURE = 1
+EXIT_INVALIDARGUMENT = 2
+EXIT_NOTIMPLEMENTED = 3
+EXIT_NOPERMISSION = 4
+EXIT_NOTINSTALLED = 5
+EXIT_NOTCONFIGURED = 6
+EXIT_NOTRUNNING = 7
+
+progname = os.path.basename(sys.argv[0])
+
+class StreamToLogger(object):
+	"""
+	Fake file-like stream object that redirects writes to a logger instance.
+	"""
+	def __init__(self, logger, log_level=logging.INFO):
+		self.logger = logger
+		self.log_level = log_level
+		self.linebuf = ''
+	
+	def write(self, buf):
+		self.logger.log(self.log_level, buf.strip('\n'))
+
+# logging objects
+defaultlvl = DEBUG
+outlogger = logging.getLogger('outMaster')
+outlogger.setLevel(defaultlvl)
+errlogger = logging.getLogger('errMaster')
+errlogger.setLevel(defaultlvl)
+
+# formatters
+format_with_date = logging.Formatter('%(asctime)s: @PROGNAME@: %(message)s'.replace('@PROGNAME@', progname))
+format_without_date = logging.Formatter() # default formatter should be good for syslog
+
+# log handlers
+outhandler = logging.StreamHandler(sys.stdout)
+outhandler.setFormatter(format_without_date)
+outlogger.addHandler(outhandler)
+errhandler = logging.StreamHandler(sys.stderr)
+errhandler.setFormatter(format_without_date)
+errlogger.addHandler(errhandler)
+
+# be sure everything is logged, redirect also stdout and stderr
+slout = StreamToLogger(outlogger, defaultlvl)
+slerr = StreamToLogger(errlogger, defaultlvl)
+
+#syslog handler
+sysloghandler = logging.handlers.SysLogHandler('/dev/log', logging.handlers.SysLogHandler.LOG_DAEMON)
+#outlogger.addHandler(sysloghandler)
+#errlogger.addHandler(sysloghandler)
+
+config_parser = None
+# unfortunately no way to specify the section as well
+defaultConfigs = {
+		'log_level': 'DEBUG',
+		'min_score': '12',
+}
+
+socket_address = None
+listen_socket = None
+systemd_socket = False
+current_connection = None
+db_manager = None
+
+pwd_min_score = 12
+invalid_credential_delay = None
+max_duration = 0
+authorized_users = None
+
+random_size = 1024
+
+ucred_t = struct.Struct('3i')
+timeval_t = struct.Struct('2Q')
+
+secret_sanitize_re = re.compile(r'[^\w.,-]')
+
+lmtp = None
+msg_templates = None
+reset_email_from = None
+
+german_tz = timezone('Europe/Berlin')
+expiry_date_format = None
+
+def logit(message, logger = outlogger, level = INFO):
+	return logger.log(level, message)
+
+log_prefix = ''
+
+def logitout(message, level = INFO):
+	logit(log_prefix + message, outlogger, level)
+	return
+
+def logiterr(message, level = INFO):
+	logit(log_prefix + message, errlogger, level)
+	return
+
+def disconnect_cconn():
+	global current_connection
+	if current_connection is not None:
+		current_connection.shutdown(socket.SHUT_RDWR)
+		current_connection.close()
+		current_connection = None
+	return
+
+def remove_socket(path):
+	# abstract socket, don't even try
+	if path[0:1] == '\0':
+		return
+	try:
+		# safety check, let's see if the file is a socket
+		# we don't want to remove an important file because of a
+		# typo in the config file
+		if S_ISSOCK(os.stat(path).st_mode):
+			os.unlink(path)
+	except OSError as e:
+		if e.errno != errno.ENOENT:
+			logiterr('Failed to remove socket file %s: %s' % (path, str(e)), INFO)
+		pass
+	return
+
+def disconnect_lsock():
+	global listen_socket
+	
+	# not our task to clean it, systemd should do it
+	if systemd_socket:
+		return
+	if listen_socket is not None:
+		listen_socket.shutdown(socket.SHUT_RDWR)
+		listen_socket.close()
+		listen_socket = None
+		remove_socket(socket_address)
+	return
+
+signnum2name = dict((getattr(signal, n), n) for n in dir(signal) if n.startswith('SIG') and '_' not in n )
+def sigterm_handler(signum, frame):
+	try:
+		signame = signnum2name[signum]
+	except KeyError:
+		signame = str(signum)
+	logiterr('Received signal %s' % signame)
+	# the atexit_handler will be called with this
+	sys.exit(0)
+
+def atexit_handler():
+	disconnect_lsock()
+	# TODO can we inform the client in a kind way?
+	disconnect_cconn()
+	disconnect_ldap()
+	db_disconnect()
+	logiterr('Shutting down')
+	return
+
+def validate_config(c):
+	global authorized_users, defaultlvl, socket_address, pwd_min_score
+	global invalid_credential_delay, max_duration
+	global db_engine, db_uri, db_username, db_password, db_name
+	global db_socket_location, msg_templates, reset_email_from
+	global expiry_date_format
+
+	# main section
+	section = 'main'
+	au = c.get(section, 'authorized_users')
+	defaultlvl = c.get(section, 'log_level')
+	if sys.version_info > '2':
+		# python3
+		socket_address = c.get(section, 'socket_address').decode('unicode_escape')
+	else:
+		# python2
+		socket_address = c.get(section, 'socket_address').decode('string_escape')
+	try:
+		opt = 'min_score'
+		pwd_min_score = int(c.get(section, opt))
+		opt = 'invalid_credential_delay'
+		invalid_credential_delay = int(c.get(section, opt))
+		opt = 'max_duration'
+		max_duration = int(c.get(section, opt))
+	except ValueError:
+		raise ConfigError('`%s\' is not a valid integer for %s' % (c.get(section, opt), opt))
+	authorized_users = []
+	for user in au.split():
+		try:
+			authorized_users.append(getpwnam(user).pw_uid)
+		except KeyError as e:
+			raise ConfigError('user %s not found' % user)
+
+	# LDAP section
+	section = 'ldap'
+	qbic_ldap_uri = c.get(section, 'qbic_ldap_uri')
+	pwadmin_bind_dn = c.get(section, 'pwadmin_bind_dn')
+	pwadmin_bind_pwd = c.get(section, 'pwadmin_bind_pwd')
+	reader_bind_dn = c.get(section, 'reader_bind_dn')
+	reader_bind_pwd = c.get(section, 'reader_bind_pwd')
+	qbic_ldap_base = c.get(section, 'qbic_ldap_base')
+	qbic_user_base = c.get(section, 'qbic_user_base') + ',' + qbic_ldap_base
+	init_ldap(qbic_ldap_uri, pwadmin_bind_dn, pwadmin_bind_pwd, reader_bind_dn, reader_bind_pwd, qbic_ldap_base, qbic_user_base)
+
+	# MySQL section
+	section = 'mysql'
+	uri = c.get(section, 'uri')
+	try:
+		(engine, uri) = uri.split('://', 1)
+	except ValueError:
+		engine = 'mysql'
+		db_uri = uri
+	if engine not in ['mysql', 'sqlite']:
+		raise ConfigError('database engine \'%s\' not supported' % engine)
+	db_engine = engine
+	db_uri = uri
+	if engine == 'mysql':
+		db_username = c.get(section, 'username')
+		db_password = c.get(section, 'password')
+		db_name = c.get(section, 'database')
+		try:
+			db_socket_location = c.get(section, 'socket_location')
+		except NoOptionError:
+			db_socket_location = None
+
+	# mail section
+	section = 'mail'
+	reset_email_from = c.get(section, 'reset_from')
+	expiry_date_format = c.get(section, 'expiry_date_format')
+	msg_templates = {}
+	for opt in c.options(section):
+		if not opt.endswith('_msg'):
+			continue
+		msg_templates[opt[:opt.rindex('_msg')].lower()] = Template(c.get(section, opt).decode('string_escape'))
+	if 'default_reset' not in msg_templates:
+		# make it raise the exception
+		msg_templates['default_reset'] = c.get(section, 'default_reset_msg')
+	# TODO VERY IMPORTANT! test the template substitution to be sure the templates are correct and will not fail later when needed
+	# FIXME before production
+	for (msg_type, msg_tmplt) in msg_templates.iteritems():
+		try:
+			msg_tmplt.substitute(
+				givenname = 'John Smith',
+				secret = 'Napoleonswhitehorsewaswhite',
+				expiry_date = 'Thursday 04 February 2016 at 13:58',
+				username = 'jsmith',
+			)
+		except (KeyError, ValueError) as e:
+			raise ConfigError('parsing template %s retuned: %s %s' % (msg_type, type(e).__name__, str(e)))
+	return
+
+### MySQL part ###
+def db_connect():
+	global db_manager
+	if db_manager is not None:
+		return
+	logitout('Connecting to database at \'%s\' with backend \'%s\'' % (db_uri, db_engine), DEBUG)
+	if db_engine == 'mysql':
+		db_manager = DBManager(
+				db_engine,
+				db_uri,
+				username = db_username,
+				password = db_password,
+				database = db_name,
+				rrequests_table = 'reset_requests',
+				unix_socket = db_socket_location
+		)
+	if db_engine == 'sqlite':
+		db_manager = DBManager(db_engine, db_uri, rrequests_table = 'reset_requests')
+	db_manager.connect()
+	return
+
+def db_disconnect():
+	global db_manager
+	if db_manager is not None:
+		db_manager.disconnect()
+		db_manager = None
+
+def db_add_request(request):
+	db_connect()
+	db_manager.add_request(request)
+	return
+
+def db_list_requests(limit = 50):
+	db_connect()
+	return db_manager.list_requests(limit)
+
+def db_get_request(secret):
+	db_connect()
+	return db_manager.get_request(secret)
+
+def db_enable_request(secret, status):
+	db_connect()
+	return db_manager.update_request_by_secret(secret, 'is_active', status)
+
+### Everything else ###
+def _generate_secret():
+	op = 'open'
+	raw_data = ''
+	try:
+		with open('/dev/urandom', 'r') as urandom:
+			op = 'read'
+			while len(raw_data) < random_size:
+				buf = urandom.read(random_size - len(raw_data))
+				raw_data += buf
+	except (IOError,OSError) as e:
+		# crap!
+		logiterr('Failed to %s /dev/urandom: %s' % (op, str(e)))
+		return None
+	return sha256(raw_data).hexdigest()
+
+def _send_emails(lmtp, msg_type, r_list):
+	ok = []
+	for (cn, email, secret, exp_date, username) in r_list:
+		try:
+			tmplt = msg_templates[msg_type]
+		except KeyError:
+			logiterr('_send_email: unknown msg_type %s' % str(e), ERROR)
+			continue
+		msg = MIMEText(tmplt.substitute(
+			givenname = cn,
+			secret = secret,
+			expiry_date = exp_date,
+			username = username,
+		))
+		msg['From'] = reset_email_from
+		msg['Subject'] = 'Password reset link for QBiC account'
+		if config.testonly:
+			logitout('[TEST] sending email to enrico instead of %s' % email, INFO)
+			msg['To'] = 'enrico.tagliavini@uni-tuebingen.de'
+		else:
+			msg['To'] = email
+		try:
+			lmtp.sendmail(reset_email_from, [email], msg.as_string())
+		except smtplib.SMTPException as e:
+			logiterr('LMTP server error during sendmail: %s' % str(e), ERROR)
+			logiterr('Aborting queued email')
+			return ok
+		except socket.error as e:
+			logiterr('Socket error during sendmail: %s' % str(e), ERROR)
+			logiterr('Aborting queued email')
+			return ok
+		ok.append(secret)
+		logitout('Sent email of type %s to `%s\'' % (msg_type, email), INFO)
+	return ok
+
+def create_request(conn, useroremail, secret, duration, enabled):
+	if useroremail.startswith('username='):
+		username = useroremail.split('=')[1]  # len will be 2 since there is a '=' char in the string
+		if len(username) <= 0:
+			raise ValueError('empty username')
+		# must check user exist in LDAP. Cannot add a request for a user that doesn't exist after all
+		# one way if checking of the user has a valid email address (necessary to send the email anyway)
+		email = get_email_from_uid(username)
+		if email is None:
+			raise ArgumentError('User not found in LDAP: %s' % username)
+	elif useroremail.startswith('email='):
+		email = useroremail.split('=')[1]  # len will be 2 since there is a '=' char in the string
+		uids = get_uid_from_email(email)
+		if uids is None or len(uids) == 0:
+			raise ArgumentError('No user found in LDAP with email %s' % email)
+		if len(uids) > 1:
+			raise ArgumentError('%d users found with email address %s: %s' % (len(uids), email, ', '.join(uids)))
+		username = uids[0]
+	else:
+		raise ValueError('useroremail should begin with username=|email=, but %s was found' % repr(useroremail))
+
+	# second argument: the secret
+	if secret == 'autogenerate':
+		secret = _generate_secret()
+		if secret is None:
+			return (a_error, 'Server failure')
+	else:
+		# check length if not autogenerated
+		if len(secret) < 32:
+			raise ArgumentError('Secret is weak: %s' % secret)
+		# IMPORTANT check the secret to contain only digits, letters and some punctuation. Nothing else is permitted
+		if secret_sanitize_re.search(secret) is not None:
+			raise BadRequest('Found forbidden character in secret')
+
+	# third argument
+	# WARNING / FIXME? duration can be up to 4 billions.... check for an lower upper limit?
+	# possibly read this from config file
+	if duration > max_duration:
+		raise ArgumentError('duration %d hours is too long' % duration)
+
+	msg = 'Added %s request for user %s valid for %d hours with secret %s to the database' % (
+			'enabled' if enabled else 'disabled', username, duration, secret
+	)
+	if not config.testonly:
+		db_add_request(ResetRequest(username, secret, duration, enabled))
+	else:
+		msg = '[TEST] ' + msg
+	logitout(msg, INFO)
+	return (a_ack, secret)
+
+def get_request(conn, args):
+	raise BadRequest('Not implemented yet')
+
+def list_requests(conn, limit):
+	logitout('listing requests with limit %d' % limit, INFO)
+	return (a_ack, db_list_requests(limit))
+
+def check_and_passwd(conn, username, secret, new_password):
+	# TODO query DB and find the request
+	req = db_get_request(secret)
+	if req is None:
+		sleep(invalid_credential_delay)
+		raise ArgumentError(
+				'secret %s not found in the database, calling username: %s' % (secret, username),
+				'Invalid credentials'
+		)
+	if req.account_name != username:
+		sleep(invalid_credential_delay)
+		raise ArgumentError(
+				'username %s not maching username in request %s (secret = %s)' % (username, req.account_name, secret),
+				'Invalid credentials'
+		)
+	# at this point of the code we are user username and secret are matching the DB
+	if not req.active:
+		sleep(invalid_credential_delay)
+		raise ArgumentError('username %s used inactive secret %s' % (username, secret), 'Invalid credentials')
+	# and now we know it's active
+	# check if it's still valid
+	if req.expired():
+		raise ArgumentError('User %s tried to use expired request. Secret is %s' % (username, secret), 'Request expired')
+	# now get some info from LDAP
+	attrs = get_attrs_from_uid(username, ['givenName', 'sn'])
+	if attrs is None:
+		sleep(invalid_credential_delay)
+		logiterr('Inconsistency found: username %s in database not found in LDAP. Secret is %s' % (username, secret), CRITICAL)
+		# maybe the user was removed from LDAP or something. Manual intervention is needed, so just close this connection
+		return (a_error, 'Internal server error')
+	# password quality check
+	(score, pw_error) = pwd_score(new_password, attrs['givenName'] + attrs['sn'])
+	if score < pwd_min_score:
+		reason = ''
+		if pw_error is not None:
+			reason = ': %s' % pw_error
+		sleep(invalid_credential_delay)
+		raise ArgumentError(
+				'%s tried to use weak password `%s\'. Score is %d' % (username, new_password, score),
+				'Weak password' + reason
+		)
+	# everything should be good, let's disable the request
+	# before actually changing the password
+	changed_rows = db_enable_request(secret, False)
+	if changed_rows != 1:
+		logiterr('Failed to disable request %s, %d row(s) changed in the database' % (secret, changed_rows))
+		return(a_error, 'Internal server error')
+	msg = 'Password changed successfully for user %s with score %d' % (username, score)
+	if not config.testonly:
+		try:
+			change_ldap_password(username, new_password)
+		except ldap.LDAPError as e:
+			send_answer(conn, a_error, 'Internal server error')
+			logiterr('LDAP error while changing password for user %s with secret %s' % (username, secret), CRITICAL)
+			raise e
+	else:
+		msg = '[TEST] ' + msg
+	logitout(msg, CRITICAL)
+	return(a_ack, 'Password changed successfully')
+
+def enable_request_common(conn, secret, status):
+	changed_rows = db_enable_request(secret, status)
+	msg = '%s request with secret %s chagned %d rows' % (
+			'Enabling' if status else 'Disabling',
+			secret,
+			changed_rows,
+	)
+	if config.testonly:
+		msg = '[TEST] ' + msg
+	logitout(msg, INFO)
+	if changed_rows == 1:
+		#return (a_ack, '%s\0%s' % (secret, str(status)))
+		return (a_ack, (secret, status))
+	else:
+		return (a_nak, 'Secret not found')
+
+def enable_request(conn, secret):
+	return enable_request_common(conn, secret, True)
+
+def disable_request(conn, secret):
+	return enable_request_common(conn, secret, False)
+
+#def send_pwreset_email(conn, secrets):
+def send_pwreset_email(conn, msg_type, secrets):
+	global lmtp
+	ok = []
+	notok = []
+	secret_list = []
+	tosend = []
+	if msg_type == 'default':
+		msg_type = 'default_reset'
+	#for (sec, msg_type) in secrets:
+	logitout('SENDEMAIL: checking %d secrets' % len(secrets))
+	for sec in secrets:
+		secret_list.append(sec)
+		req = db_get_request(sec)
+		if req is None or msg_type not in msg_templates or req.expired() or not req.active:
+			if req is None:
+				msg = 'secret not found'
+			if msg_type not in msg_templates:
+				msg = 'cannot find message type %s' % msg_type
+			if req.expired():
+				msg = 'request expired'
+			if not req.active:
+				msg = 'request is not active'
+			logiterr('Not sending email for secret %s: %s' % (repr(sec), msg), INFO)
+			continue
+		attrs = get_attrs_from_uid(req.account_name, ['cn', 'mail'])
+		if attrs is None:
+			logiterr('Not sending email for secret %s: user %s not found in LDAP' % (repr(sec), req.account_name), INFO)
+			continue
+		cn = attrs['cn'][0]
+		email = attrs['mail'][0] # take the first one in case user has more
+		# compute the expiration date and time
+		exp_date = req.expiry_date(tz = german_tz).strftime(expiry_date_format)
+		tosend.append((cn, email, req.secret_code, exp_date, req.account_name))
+	lmtp = smtplib.LMTP()
+	try:
+		op = 'connect'
+		lmtp.connect()
+		# _send_emails will not actually raise smtplib.SMTPException
+		# since it already catches them.
+		op = 'send'
+		ok = _send_emails(lmtp, msg_type, tosend)
+		op = 'quit'
+		lmtp.quit()
+	except smtplib.SMTPException as e:
+		logiterr('LMTP server error on %s: %s' % (op, str(e)), ERROR)
+	except socket.error as e:
+		logiterr('Socket error during %s to LMTP server: %s' % (op, str(e)), ERROR)
+	notok = [x for x in secret_list if x not in ok]
+	ack = a_ack
+	if len(ok) == 0:
+		ack = a_nak
+		logitout('SENDEMAIL: no email sent, all secret failed')
+	else:
+		logitout('SENDEMAIL: sent %d mail(s)' % len(ok))
+	return (ack, (ok, notok))
+
+def test_protocol(conn, args):
+	if config.testonly:
+		status = None
+		answer = args
+	else:
+		status = a_nak
+		answer = 'no testing is allowed'
+	return (status, answer)
+
+cmd2funct = {
+	'CREATEREQUEST': create_request,
+	'GETREQUEST': get_request,
+	'LISTREQUESTS': list_requests,
+	'RESETPW': check_and_passwd,
+	'ENABLEREQUEST': enable_request,
+	'DISABLEREQUEST': disable_request,
+	'SENDEMAIL': send_pwreset_email,
+	'TESTPROTOCOL': test_protocol,
+}
+cmd_list = cmd2funct.keys() + ['KTHXBYE']
+def handle_connection(conn):
+	status = a_error  # safety default
+	(cmd, args) = get_command(conn)
+	while cmd is not None:
+		if args != None and cmd in cmd2funct:
+			try:
+				(status, answer) = cmd2funct[cmd](conn, *args)
+			except ProtocolError as e:
+				# being a bit lazy here to avoid passing cmd as a parameter
+				raise ProtocolError('%s: %s' % (cmd, e.message), e.errors)
+			except ArgumentError as e:
+				send_answer(conn, a_nak, e.client_message())
+				raise ArgumentError('%s: %s' % (cmd, e.message))
+			except BadRequest as e:
+				send_answer(conn, a_badrequest, str(e))
+				raise Badrequest('%s: %s' % (cmd, e.message))
+			# send answer over
+			send_answer(conn, status, answer, cmd)
+		elif cmd == 'KTHXBYE':
+			return
+		if status in [a_error]:
+			return
+		(cmd, args) = get_command(conn)
+	return
+
+def authenticate_and_handle((conn, address)):
+	global current_connection
+	global log_prefix
+	current_connection = conn
+	creds = current_connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, ucred_t.size)
+	(pid, uid, gid) = ucred_t.unpack(creds)
+	logitout('Got a connection from %s, PID %d, UID %d' % (address, pid, uid), DEBUG)
+	if address == '':
+		address = 'AF_UNIX:%d' % pid
+	log_prefix = '[%s %d]: ' % (address, uid)
+	if uid not in authorized_users:
+		logitout('Not authorized, closing connection')
+	else:
+		# set a timeout for recv (and alike) operations. If client gets stuck
+		# we'll just close the connection
+		current_connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, timeval_t.pack(15, 0))
+		# same for send, would be bad to get stuck
+		current_connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, timeval_t.pack(15, 0))
+		try:
+			handle_connection(current_connection)
+			logitout('Disconnected', INFO)
+		except ProtocolError as e:
+			logiterr('Disconnecting because of protocol error: ' + str(e), INFO)
+		except socket.error as e:
+			if e.errno and e.errno in [EAGAIN, EWOULDBLOCK]:
+				logiterr('Connection timed out: ' + str(e), INFO)
+			else:
+				logiterr('Connection terminate due to socket error: ' + str(e), INFO)
+				print_exc()
+		except (MySQLdb.Error, sqlite3.Error) as e:
+			send_answer(conn, a_error, 'Internal server error')
+			logiterr('Database error: %s' % str(e), ERROR)
+			print_exc()
+			logitout('Disconnecting due to previous Database error', INFO)
+		except ldap.LDAPError as e:
+			send_answer(conn, a_error, 'Internal server error')
+			logiterr('LDAP error: %s' % str(e), ERROR)
+			print_exc()
+			logitout('Disconnecting due to previous LDAP error', INFO)
+		except BadRequest as e:
+			logitout('Disconnecting after Bad Request: ' + str(e), INFO)
+		except ArgumentError as e:
+			logitout('Disconnecting after Argument Error: ' + str(e), INFO)
+	log_prefix = ''
+	db_disconnect()
+	disconnect_ldap()
+	disconnect_cconn()
+
+def pw_resetd_main(args):
+	global listen_socket
+	global config_parser
+	global systemd_socket
+
+	if args.test is not None:
+		config.testonly = args.test
+	if args.log_target is 'syslog':
+		outlogger.addHandler(sysloghandler)
+		outlogger.removeHandler(outhandler)
+		errlogger.addHandler(sysloghandler)
+		errlogger.removeHandler(errhandler)
+	elif args.log_target is 'console':
+		outhandler.setFormatter(format_with_date)
+		errhandler.setFormatter(format_with_date)
+
+	config_parser = RawConfigParser(defaultConfigs)
+	op = 'opening'
+	try:
+		with open(args.config_file, 'r') as f:
+			op = 'reading'
+			try:
+				# python >= 3.2
+				config_parser.read_file(f)
+			except AttributeError:
+				# python < 3.2
+				config_parser.readfp(f)
+	except Exception as e:
+		logiterr('Error while %s config file %s: %s' % (op, args.config_file, str(e)), ERROR)
+		#logiterr('Shutting down', ERROR)
+		sys.exit(EXIT_NOTCONFIGURED)
+	try:
+		validate_config(config_parser)
+	except ConfigError as e:
+		logiterr('Error while parsing config: %s' % str(e), ERROR)
+		#logiterr('Shutting down', ERROR)
+		sys.exit(EXIT_NOTCONFIGURED)
+
+	logiterr('Starting with whitelisted UIDs: %s' % ', '.join([str(x) for x in authorized_users]), DEBUG)
+	sd_fds = listen_fds()
+	if len(sd_fds) > 1:
+		logiterr('Too many fds passed by systemd. Need only one. Aborting', ERROR)
+		sys.exit(EXIT_INVALIDARGUMENT)
+	if len(sd_fds) == 1:
+		if not is_socket_unix(sd_fds[0], type = socket.SOCK_STREAM):
+			logiterr('Socket passed by systemd is not of family AF_UNIX or of type SOCK_STREAM. Aborting', ERROR)
+			sys.exit(EXIT_INVALIDARGUMENT)
+		systemd_socket = True
+		listen_socket = socket.fromfd(sd_fds[0], socket.AF_UNIX, socket.SOCK_STREAM)
+		if not is_socket_unix(sd_fds[0], type = socket.SOCK_STREAM, listening = 1):
+			logitout(
+				'Using listening socket passed by systemd, ignoring \'socket_address\' from config file',
+				INFO
+			)
+		else:
+			logitout('Using non listening socket passed by systemd, ignoring \'socket_address\' from config file', INFO)
+			listen_socket.listen(1)
+	else:
+		listen_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		logitout('Binding new socket', INFO)
+		# if the socket is a file it should be unlinked first. SO_REUSEADDR doesn't work
+		# with unix socket based on files, only with abstract unix sockets
+		remove_socket(socket_address)
+		try:
+			listen_socket.bind(socket_address)
+		except socket.error as e:
+			logitout('Error while binding to `%s\': %s' % (socket_address, str(e)))
+			sys.exit(EXIT_FAILURE)
+		listen_socket.listen(1)
+	while True:
+		authenticate_and_handle(listen_socket.accept())
+
+#if __name__ == '__main__':
+def main(argv = None):
+	sys.stdout = slout
+	sys.stderr = slout
+	
+	parser = argparse.ArgumentParser(description='QBiC password reset service provider daemon')
+	parser.add_argument('-t', '--test', '--test-only', '--dry-run',
+			required=False,
+			action='store_true',
+			default=True,
+			dest='test',
+			help='Runs in test mode, doesn\'t apply any change or perform any permanent operation on the systems involved'
+	)
+	parser.add_argument('--production',
+			required=False,
+			action='store_false',
+#			default=False,
+			dest='test',
+			help='Opposite of test mode (--test). Will run in production, all changes will go to database and LDAP'
+	)
+	parser.add_argument('-c', '--config', '--config-file',
+			required=True,
+			action='store',
+			dest='config_file',
+			help='path to the config file to use'
+	)
+	parser.add_argument('--log-target',
+		choices = ['console', 'syslog'],
+		required = False,
+		default = 'console',
+		help = 'select the log target. Console will log to stdout and stderr, syslog will use the system logger'
+	)
+
+	args = parser.parse_args(argv)
+
+	ret = 0
+	atexit.register(atexit_handler)
+	signal.signal(signal.SIGTERM, sigterm_handler)
+	signal.signal(signal.SIGINT, sigterm_handler)
+	try:
+		pw_resetd_main(args)
+	except KeyboardInterrupt:
+		ret = EXIT_FAILURE
+		print('')
+	except Exception as e:
+		ret = EXIT_FAILURE
+		print_exc()
+
+	sys.exit(ret)
+
+if __name__ == '__main__':
+	main(sys.argv[1:])
+

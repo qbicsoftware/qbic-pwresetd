@@ -1,0 +1,12 @@
+[Unit]
+Description=Password reset daemon for QBiC LDAP
+After=syslog.target network.target mariadb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/qbic-pwresetd -c /etc/pwreset/qbic-pwresetd.ini --log-target=syslog --production
+User=pwadmin
+Group=pwadmin
+
+[Install]
+WantedBy=multi-user.target
