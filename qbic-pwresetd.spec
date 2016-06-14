@@ -15,7 +15,7 @@ Release:	1%{?dist}
 Summary:	Password reset daemon for QBiC LDAP
 
 Group:		System Environment/Daemons
-License:	GPLv3
+License:	LGPLv2.1
 URL:		http://portal.qbic.uni-tuebingen.de/
 Source0:	qbic_pwresetd-%{version}.tar.gz
 
