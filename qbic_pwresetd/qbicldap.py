@@ -134,7 +134,7 @@ def get_uid_from_email(email):
 
 def _crypt_password(pwd):
 	lc = ldap_context.replace(default=ldap_crypto_context)
-	return lc.encrypt(pwd, salt_size=16)
+	return lc.encrypt(pwd, rounds=5000, salt_size=16)
 
 def _change_ldap_password(uid, new_password):
 	connect_pwadmin_ldap()
